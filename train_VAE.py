@@ -118,7 +118,7 @@ def main(args):
             for D_norm, X_true in train_loader:
                 B, Lmax = D_norm.shape
                 mu, sigma = vae.encoder(D_norm.to(device))
-                z = mu  # [B, z_dim]
+                z = munce
                 z_vals.append(z.cpu())
 
                 all_params = vae.decoder(z)
@@ -135,7 +135,7 @@ def main(args):
                     n_models += 1
             train_mse.append(mse_accum / n_models)
             train_rmsd.append(rmsd_accum / n_models)
-            print("Epoch:", epoch, " ELBO:", avg_elbo, "RMSD:", rmsd_accum)
+            print("Epoch:", epoch, " ELBO:", avg_elbo, "RMSD:", rmsd_accum/ n_models)
 
             z_all = torch.cat(z_vals, dim=0).view(-1).numpy()
             latent_hist.append(z_all)
