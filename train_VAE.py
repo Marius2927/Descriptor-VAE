@@ -1,22 +1,28 @@
 import argparse
+import random
 import torch
-import torch.nn.functional as F
+import numpy as np
 import pyro
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
-from torch.utils.data import Dataset, DataLoader, random_split
-from CliffordGreen import GaussianPointDescriptor
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from model import VAE, CliffordGreenDescriptorDataset
+
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
+pyro.set_rng_seed(0)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 16
-Z_DIM = 4
-HIDDEN_SIZE = 64
+Z_DIM = 8
+HIDDEN_SIZE = [64, 128, 256]
 LEARNING_RATE = 1e-6
 NUM_EPOCHS = 10000
+WARMUP = 500
 
 def train(svi, train_loader, beta, use_cuda=False):
     epoch_loss = 0.0
@@ -27,7 +33,6 @@ def train(svi, train_loader, beta, use_cuda=False):
     normalizer_train = len(train_loader.dataset)
     return epoch_loss / normalizer_train
 
-
 def evaluate(svi, test_loader, use_cuda=False):
     total_loss = 0.0
     for D_batch, X_batch in test_loader:
@@ -37,125 +42,97 @@ def evaluate(svi, test_loader, use_cuda=False):
     normalizer_test = len(test_loader.dataset)
     return total_loss / normalizer_test
 
-def compute_recon_mse(vae, loader):
-    total = 0.0
-    with torch.no_grad():
-        for D in loader:
-            x      = D.squeeze(0).unsqueeze(0)
-            mu_q, _= vae.encoder(x)
-            z      = mu_q.detach()
-            out    = vae.decoder(z, 1)
-            mu_pred, _ = out.chunk(2, dim=-1)
-            total += F.mse_loss(mu_pred, x, reduction="sum").item()
-    return total / len(loader.dataset)
+def kabsch_rmsd(A, B):
+    A0 = A - A.mean(axis=0, keepdims=True)
+    B0 = B - B.mean(axis=0, keepdims=True)
+    C  = A0.T @ B0
 
+    U, S, Vt = np.linalg.svd(C)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1,1,d]) @ U.T
 
-def kabsch_rmsd(A: torch.Tensor, B: torch.Tensor) -> float:
-    """
-    Compute RMSD between two point clouds A, B of shape [N,3] after optimal alignment.
-    """
-    # center
-    A0 = A - A.mean(dim=0, keepdim=True)
-    B0 = B - B.mean(dim=0, keepdim=True)
-    # covariance
-    C = A0.T @ B0  # [3,3
-    U, S, Vt = torch.svd(C)
-    d = torch.det(Vt @ U.T)
-    D = torch.diag(torch.tensor([1.0, 1.0, d], device=A.device))
-    R = Vt @ D @ U.T
-    A_rot = (A0 @ R.T)
-    return torch.sqrt( ((A_rot - B0)**2).mean() ).item()
-
-def descriptor_mse(D_true: torch.Tensor, D_hat: torch.Tensor) -> float:
-    """
-    MSE over a single descriptor vector
-    """
-    return torch.mean( (D_true - D_hat)**2 ).item()
+    A1 = A0 @ R.T
+    diff2 = (A1 - B0)**2
+    return np.sqrt(diff2.mean())
 
 def main(args):
     Z_DIM = args.z_dim
-    HIDDEN_SIZE = args.hidden_size
+    HIDDEN_SIZE = args.hidden_sizes
+    LEARNING_RATE = args.learning_rate
     NUM_EPOCHS = args.num_epochs
+    pdb_file = args.pdb
     pyro.clear_param_store()
 
-    pdb_files = ["data/1unc.pdb", "data/1fsd.pdb"]
-    dataset = CliffordGreenDescriptorDataset(pdb_files)
-
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_ds, test_ds = random_split(dataset, [train_size, test_size])
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    dataset = CliffordGreenDescriptorDataset(pdb_file)
 
     descriptor_dim = dataset.D.shape[1]
     D_mean = dataset.D.mean(dim=0)
     D_std = dataset.D.std(dim=0) + 1e-6
 
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
     vae = VAE(descriptor_dim, z_dim=Z_DIM, hidden_size=HIDDEN_SIZE, D_mean=D_mean, D_std=D_std)
-    optimizer = Adam({"lr": LEARNING_RATE})
-    svi = SVI(vae.model, vae.guide, optimizer, loss=Trace_ELBO())
+    opt = Adam({"lr": LEARNING_RATE})
+    svi = SVI(vae.model, vae.guide, opt, loss=Trace_ELBO())
 
     train_elbo = []
-    test_elbo = []
     train_mse = []
     train_rmsd = []
+    zs = []
     latent_hist = []
 
+    patience = 25  # stop if no improvement for 25 epochs
+    epochs_without_improve = 0
+
     for epoch in range(NUM_EPOCHS):
-        beta = min(1.0, epoch / 100)
+        beta = min(1.0, epoch / WARMUP)
         avg_elbo = train(svi, train_loader, beta)
         train_elbo.append(-avg_elbo)
-        #print("Epoch:", epoch, " ELBO:",avg_elbo)
 
+        rmsd_accum = 0.0
+        n_samples = 0
+        mse_accum = 0
         with torch.no_grad():
-            mse_accum = 0.0
-            rmsd_accum = 0.0
-            n_models = 0
-            z_vals = []
-
-
             for D_norm, X_true in train_loader:
-                B, Lmax = D_norm.shape
-                mu, sigma = vae.encoder(D_norm.to(device))
-                z = munce
-                z_vals.append(z.cpu())
-
-                all_params = vae.decoder(z)
-                half = all_params.size(1) // 2
-                mu_norm = all_params[:, :half]
-                D_rec_raw = mu_norm * D_std + D_mean
-                D_true_raw = D_norm * D_std + D_mean
-
-                mse_accum += descriptor_mse(D_true_raw, D_rec_raw)
+                D_norm = D_norm.to(device)
+                X_true = X_true.to(device)
+                B, _ = D_norm.shape
 
                 for b in range(B):
-                    X_rec = GaussianPointDescriptor.descriptor_to_coordinates(D_rec_raw[b])
-                    rmsd_accum += kabsch_rmsd(X_true[b], X_rec)
-                    n_models += 1
-            train_mse.append(mse_accum / n_models)
-            train_rmsd.append(rmsd_accum / n_models)
-            print("Epoch:", epoch, " ELBO:", avg_elbo, "RMSD:", rmsd_accum/ n_models)
+                    X_rec, mse, mu_z = vae.reconstruct_from_mean(D_norm[b])
+                    rmsd_accum += kabsch_rmsd(
+                        X_true[b].cpu().numpy(),
+                        X_rec.cpu().numpy()
+                    )
+                    mse_accum += mse
+                    zs.append(mu_z.cpu())
+                n_samples += B
 
-            z_all = torch.cat(z_vals, dim=0).view(-1).numpy()
-            latent_hist.append(z_all)
+        train_mse.append(mse_accum / n_samples)
+        train_rmsd.append(rmsd_accum / n_samples)
+        latent_hist.append(torch.cat(zs, dim=0).view(-1).numpy())
 
-    torch.save({
-        "desc_dim": descriptor_dim,
-        "D_mean": D_mean.cpu(),
-        "D_std": D_std.cpu(),
-        "state_dict": vae.state_dict()
-    }, "vae_checkpoint.pt")
+        torch.save({
+            "desc_dim": descriptor_dim,
+            "D_mean": D_mean.cpu(),
+            "D_std": D_std.cpu(),
+            "state_dict": vae.state_dict()
+        }, "vae_checkpoint.pt")
 
-    # Loss curves
+        if epoch>WARMUP:
+            epochs_without_improve += 1
+            if epochs_without_improve >= patience:
+                print(f"Early stopping at epoch {epoch} (best RMSD: {train_rmsd[-patience]:.4f})")
+                break
+
+        print(f"Epoch {epoch:3d} | ELBO={-avg_elbo:8.3f}| MSE={train_mse[-1]:5.3f} | RMSD={train_rmsd[-1]:5.3f}")
+
     plt.figure()
     plt.plot(train_elbo, label="Train ELBO")
     plt.xlabel("Epoch")
     plt.ylabel("ELBO")
     plt.legend()
-    plt.savefig("plt10.png")
+    plt.savefig("plt1.png")
 
-    # MSE & RMSD
     plt.figure(figsize=(8, 4))
     plt.subplot(1, 2, 1)
     plt.plot(train_mse, label="Desc-MSE")
@@ -190,7 +167,7 @@ def main(args):
     ax.set_title("3D PCA of Descriptors")
     plt.savefig("plt4.png")
 
-    for i, z_all in enumerate(latent_hist[::max(1, NUM_EPOCHS // 5)]):  # 5 snapshots
+    for i, z_all in enumerate(latent_hist[::max(1, NUM_EPOCHS // 5)]):
         plt.figure()
         plt.hist(z_all, bins=50, density=True)
         plt.title(f"Epoch {i * (NUM_EPOCHS // 5)} latent z distribution")
@@ -200,8 +177,10 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--z_dim", choices=[4, 8, 16, 32], default=4)
-    p.add_argument("--hidden_size", choices=[32, 64, 128, 256], default=64)
-    p.add_argument("--num_epochs", choices=[1000, 5000, 10000], default=500)
+    p.add_argument("--pdb", type=str, default='data/1unc.pdb')
+    p.add_argument("--z_dim", choices=[4, 8, 16, 32], default=8)
+    p.add_argument("--hidden_sizes", choices=[[32, 64, 128], [64, 128, 256]], default=[64, 128, 256])
+    p.add_argument("--num_epochs", choices=[500, 1000, 5000, 10000], default=500)
+    p.add_argument("--learning_rate", choices=[1e-5, 2e-5, 5e-5, 1e-6], default=2e-6)
     args = p.parse_args()
     main(args)

@@ -4,98 +4,86 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset
 from CliffordGreen import GaussianPointDescriptor
-import Bio.PDB as bio
 from Bio.PDB import PDBParser
 
-def g(x):
-    return torch.where(x >= 0, x + 0.5, torch.sigmoid(x))
-
-def log_g(x):
-    return torch.where(x >= 0, (x + 0.5).log(), -F.softplus(-x))
-
-class MiniGRU(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.linear_z = nn.Linear(input_size, hidden_size)
-        self.linear_h = nn.Linear(input_size, hidden_size)
-
-    def forward(self, x_t, h_prev):
-        z = torch.sigmoid(self.linear_z(x_t))
-        h_tilde = g(self.linear_h(x_t))
-        h_t = (1 - z) * h_prev + z * h_tilde
-        return h_t
-
-class MiniGRU_parallel(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.linear_z = nn.Linear(input_size, hidden_size)
-        self.linear_h = nn.Linear(input_size, hidden_size)
-
-    def forward_parallel(self, x, h0):
-        seq_len, _ = x.shape
-        k = self.linear_z(x)
-        log_z = -F.softplus(-k)
-        log_coeffs = -F.softplus(k)
-        log_h0 = log_g(h0)
-        log_tilde_h = log_g(self.linear_h(x))
-        sequence = torch.cat([log_h0.unsqueeze(0), log_z + log_tilde_h], dim=0)
-        a_star = F.pad(torch.cumsum(log_coeffs, dim=0), (0,0,1,0))
-        log_h0_plus_b_star = torch.logcumsumexp(sequence - a_star, dim=0)
-        log_h = a_star + log_h0_plus_b_star
-        return torch.exp(log_h)[1:]
 
 class Encoder(nn.Module):
-    def __init__(self, descriptor_dim, z_dim, hidden_size):
+    def __init__(self, z_dim, hidden_size, descriptor_dim):
         super().__init__()
+        assert isinstance(hidden_size, (list, tuple)) and len(hidden_size) == 3, f"hidden_size must be a 3‐element list, got {hidden_size}"
         self.net = nn.Sequential(
-            nn.Linear(descriptor_dim, hidden_size),
+            nn.Linear(descriptor_dim, hidden_size[2]),
             nn.ReLU(),
-            nn.Linear(hidden_size, 2 * z_dim)
+            nn.Linear(hidden_size[2], hidden_size[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_size[1], hidden_size[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_size[0], 2 * z_dim)   # outputs both mu and raw sigma, concatenated
         )
         self.z_dim = z_dim
+        self.descriptor_dim = descriptor_dim
 
     def forward(self, x):
         """
-        :param x: [B, descriptor_dim]
-        :returns: (mu, sigma) each of shape [B, z_dim]
+        x: [B, descriptor_dim] batch size and descriptor dimension
+        returns: (mu, sigma) each [B, z_dim]
         """
-        enc_out = self.net(x)            # [B, 2*z_dim]
+        assert x.dim() == 2, f"Encoder expected a 2D tensor, got shape {tuple(x.shape)}"
+        batch_size, feat = x.shape
+        assert feat == self.descriptor_dim, f"Encoder expected input of shape [batch_size, {self.descriptor_dim}], but got {tuple(x.shape)}"
+        enc_out = self.net(x)                 # [B, 2*z_dim]
         mu, log_sigma = enc_out.chunk(2, dim=-1)
-        sigma = F.softplus(log_sigma) + 1e-6
+        sigma = F.softplus(log_sigma) + 1e-6  # ensure positivity
+        assert mu.shape == (batch_size, self.z_dim), f"Encoder output mu has shape {tuple(mu.shape)}, expected ({batch_size}, {self.z_dim})"
         return mu, sigma
 
+
 class Decoder(nn.Module):
-    def __init__(self, z_dim, hidden_size, descriptor_dim):
+    def __init__(self, z_dim, hidden_dim, descriptor_dim):
         super().__init__()
+        assert isinstance(hidden_dim, (list, tuple)) and len(hidden_dim) == 3, f"hidden_dim must be a 3‐element list, got {hidden_dim}"
         self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden_size),
+            nn.Linear(z_dim, hidden_dim[0]),
             nn.ReLU(),
-            nn.Linear(hidden_size, 2 * descriptor_dim)
+            nn.Linear(hidden_dim[0], hidden_dim[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dim[1], hidden_dim[2]),
+            nn.ReLU(),
+            nn.Linear(hidden_dim[2], 2 * descriptor_dim)  # outputs both mu and raw sigma concatenated
         )
+        self.z_dim = z_dim
+        self.descriptor_dim = descriptor_dim
 
     def forward(self, z):
         """
         :param z: [B, z_dim]
-        :returns: concatenated [mu | log_sigma] of shape [B, 2*descriptor_dim]
+        :returns:
+           mu    : [B, descriptor_dim]
+           sigma : [B, descriptor_dim]
         """
-        return self.net(z)
+        assert z.dim() == 2, f"Decoder expected 2D input, got shape {tuple(z.shape)}"
+        B, zd = z.shape
+        assert zd == self.z_dim, f"Decoder expected z of shape [{B}, {self.z_dim}], but got {tuple(z.shape)}"
+        out = self.net(z)                   # [B, 2*D]
+        mu, log_sigma = out.chunk(2, dim=-1)
+        sigma = F.softplus(log_sigma) + 1e-6
+        assert mu.shape == (B, self.descriptor_dim), f"Decoder output mu has shape {tuple(mu.shape)}, expected ({B}, {self.descriptor_dim})"
+        return mu, sigma
 
 class VAE(nn.Module):
     def __init__(self,
                  descriptor_dim: int,
                  z_dim: int,
-                 hidden_size: int,
-                 D_mean: torch.Tensor,
-                 D_std: torch.Tensor):
+                 hidden_size,
+                 D_mean,
+                 D_std):
         super().__init__()
         self.descriptor_dim = descriptor_dim
         self.z_dim = z_dim
-        self.D_mean = D_mean   # [descriptor_dim]
-        self.D_std  = D_std    # [descriptor_dim]
+        self.D_mean = D_mean
+        self.D_std = D_std
 
         # Precompute diagonal vs off-diagonal indices
         all_idx = list(range(descriptor_dim))
@@ -108,36 +96,35 @@ class VAE(nn.Module):
         self.register_buffer('num_diag', torch.tensor(len(diag_idx)))
         self.register_buffer('num_off',  torch.tensor(len(off_diag_idx)))
 
-        self.encoder = Encoder(descriptor_dim, z_dim, hidden_size)
+        self.encoder = Encoder(z_dim, hidden_size, descriptor_dim)
         self.decoder = Decoder(z_dim, hidden_size, descriptor_dim)
 
     def model(self, x, beta=1.0, *args, **kwargs):
         """
         x: [B, descriptor_dim]
         """
+
+        assert x.dim() == 2, f"model() got x shape {tuple(x.shape)}, expected 2D"
         B, Ddim = x.shape
-        assert Ddim == self.descriptor_dim
+        assert Ddim == self.descriptor_dim, f"model() expected descriptor_dim={self.descriptor_dim}, but got {Ddim}"
 
         pyro.module("decoder", self.decoder)
-        z_loc   = x.new_zeros(self.z_dim)
+        z_loc = x.new_zeros(self.z_dim)
         z_scale = x.new_ones(self.z_dim)
 
         with pyro.plate("batch", B):
-            z = pyro.sample("latent",
-                            dist.Normal(z_loc, z_scale).to_event(1), infer={"scale": beta})
+            # sample from the normal prior
+            z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1), infer={"scale": beta})
 
-            out = self.decoder(z)
-            mu, log_sigma = out.chunk(2, dim=-1)
-            sigma = F.softplus(log_sigma) + 1e-6
+            # decode into mu and sigma
+            mu, sigma = self.decoder(z)  # each [B, descriptor_dim]
 
             # Off-diagonals (Normal)
             obs_off   = x.index_select(dim=1, index=self.idx_off)  # [B, K_off]
             mu_off    =    mu.index_select(dim=1, index=self.idx_off)  # [B, K_off]
             sigma_off = sigma.index_select(dim=1, index=self.idx_off)  # [B, K_off]
 
-            pyro.sample("D_off",
-                        dist.Normal(mu_off, sigma_off).to_event(1),
-                        obs=obs_off)
+            pyro.sample("D_off", dist.Normal(mu_off, sigma_off).to_event(1), obs=obs_off)
 
             # Diagonals (Chi2)
             obs_diag = x.index_select(dim=1, index=self.idx_diag)   # [B, K_diag]
@@ -147,9 +134,7 @@ class VAE(nn.Module):
             raw = obs_diag * D_std_d.unsqueeze(0) + D_mean_d.unsqueeze(0)  # [B, K_diag]
             obs_sq = torch.clamp(raw * raw, min=1e-3)                      # [B, K_diag]
 
-            pyro.sample("D_diag",
-                        dist.Chi2(df=3).expand([B, self.num_diag]).to_event(1),
-                        obs=obs_sq)
+            pyro.sample("D_diag", dist.Chi2(df=3).expand([B, self.num_diag]).to_event(1), obs=obs_sq)
 
     def guide(self, x, *args, **kwargs):
         """
@@ -162,214 +147,70 @@ class VAE(nn.Module):
 
         with pyro.plate("batch", B):
             mu_z, sigma_z = self.encoder(x)
-            pyro.sample("latent",
-                        dist.Normal(mu_z, sigma_z).to_event(1))
+            pyro.sample("latent", dist.Normal(mu_z, sigma_z).to_event(1))
 
     def is_diagonal(self, i):
         return (i == 0) or ((i - 1) % 2 == 0)
 
-    def reconstruct(self, x):
+    def reconstruct_from_mean(self, D_norm):
         """
-        Reconstruct 3D coordinates from input descriptor x by sampling z.
-        x: [seq_len, descriptor_dim]
-        Returns: X_rec: [N, 3]
+        Given a single normalized descriptor D_norm ([descriptor_dim]),
+        encode to z, decode its mean back to a descriptor, un‐normalize,
+        and reconstruct 3D coords.
         """
+        # pack into a batch of size 1
+        Dn = D_norm.unsqueeze(0)  # [1, descriptor_dim]
+        # encode and get mean z
+        z_mu, _ = self.encoder(Dn)  # both [1, z_dim]
+        mu_D_norm, _ = self.decoder(z_mu)  # both [1, descriptor_dim]
+        D_rec_raw = mu_D_norm.squeeze(0) * self.D_std + self.D_mean  # [descriptor_dim]
+        X_rec = GaussianPointDescriptor.descriptor_to_coordinates(D_rec_raw)
+        mse = (D_rec_raw - D_norm * self.D_std - self.D_mean).pow(2).mean().item()
 
-        z_loc, z_sigma = self.encoder(x)
-        z = dist.Normal(z_loc, z_sigma).sample()
-        seq_len, descriptor_dim = x.shape
-
-        out = self.decoder(z, seq_len)
-        mu, log_sigma = out.chunk(2, dim=-1)
-
-        D_rec = mu.squeeze(0)
-
-        X_rec = GaussianPointDescriptor.descriptor_to_coordinates(D_rec, torch.eye(3, device=D_rec.device, dtype=D_rec.dtype))
-        return X_rec
-
-    def reconstruct_from_mean(self, x):
-        """
-        Reconstruct 3D coordinates using the mean latent vector.
-        x: [seq_len, descriptor_dim]
-        Returns: X_rec: [N, 3]
-        """
-        z_loc, z_sigma = self.encoder(x)
-        z = z_loc  # use mean
-        seq_len, descriptor_dim = x.shape
-        out = self.decoder(z, seq_len)
-        mu, log_sigma = out.chunk(2, dim=-1)
-        D_rec = mu.squeeze(0)
-        X_rec = GaussianPointDescriptor.descriptor_to_coordinates(D_rec, torch.eye(3, device=D_rec.device, dtype=D_rec.dtype))
-        return X_rec
+        return X_rec, mse, z_mu
 
 
 class CliffordGreenDescriptorDataset(Dataset):
-    def __init__(self, pdb_files):
-        parser = PDBParser(QUIET=True)
-        all_coords = []
-        for pdb_path in pdb_files:
-            structure = parser.get_structure("prot", pdb_path)
-            for model in structure.get_models():
-                coords = [atom.get_coord()
-                          for atom in model.get_atoms()]
-                if coords:
-                    all_coords.append(np.stack(coords, axis=0))
+    """
+    Loads one multi‐model PDB file, extracts only backbone atoms (N, CA, C)
+    from each model (in residue‐order) and builds Clifford–Green descriptors.
+    """
+    def __init__(self, pdb_path: str):
+        parser     = PDBParser(QUIET=True)
+        structure  = parser.get_structure("ensemble", pdb_path)
+        coords_list = []
 
-        # keep only those with the most common atom‐count
-        N_atoms_list = [c.shape[0] for c in all_coords]
-        mode_N       = max(set(N_atoms_list), key=N_atoms_list.count)
-        kept = [c for c in all_coords if c.shape[0] == mode_N]
+        # collect [N_bb × 3] arrays for each model
+        for model in structure:
+            bb_coords = []
+            for chain in model:
+                for residue in chain:
+                    for atom in residue:
+                        if atom.get_name() in ("N", "CA", "C"):
+                            bb_coords.append(atom.get_coord())
+            if bb_coords:
+                coords_list.append(np.stack(bb_coords, axis=0))
 
-        X_np = np.stack(kept, axis=0).astype(np.float32)
+        if not coords_list:
+            raise ValueError(f"No backbone atoms found in {pdb_path}")
+
+        lengths = [c.shape[0] for c in coords_list]
+        if len(set(lengths)) != 1:
+            raise ValueError(f"Backbone atom counts differ across models: {set(lengths)}")
+        self.N_bb = lengths[0]
+
+        X_np = np.stack(coords_list, axis=0).astype(np.float32)
         self.X = torch.from_numpy(X_np)
 
         D_list = []
-        for b in range(len(self.X)):
-            D_list.append(GaussianPointDescriptor.coordinates_to_descriptor(self.X[b]))
+        for m in range(self.X.shape[0]):
+            D = GaussianPointDescriptor.coordinates_to_descriptor(self.X[m])
+            D_list.append(D)
         self.D = torch.stack(D_list, dim=0)
 
     def __len__(self):
-        return self.D.shape[0]
+        return self.D.size(0)
 
     def __getitem__(self, idx):
+        # returns (descriptor, backbone_coords_of_that_model)
         return self.D[idx], self.X[idx]
-
-
-def setup_data_loaders(pdb_files, train_ratio=0.8):
-    dataset = CliffordGreenDescriptorDataset(pdb_files)
-    total_size = len(dataset)
-    train_size = int(train_ratio * total_size)
-    test_size = total_size - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-    return train_loader, test_loader
-
-def load_all_atoms(pdb_path: str):
-    """
-    Parse the input PDB file and return:
-      - X         : torch.Tensor of shape [N_atoms, 3], in the exact order atoms appear
-      - info_list : list of length N_atoms, where each entry is a dict containing:
-            {
-              'atom_name': str,
-              'res_name' : str,
-              'chain_id' : str,
-              'res_id'   : int,
-              'altloc'   : str,
-              'i_code'   : str,
-              'occupancy': float,
-              'tempfactor': float,
-              'element'  : str,
-              'charge'   : str,
-            }
-    Loads both ATOM and HETATM records.
-    """
-    parser    = bio.PDBParser(QUIET=True)
-    structure = parser.get_structure("prot", pdb_path)
-    model     = next(structure.get_models())
-
-    atom_coords = []
-    info_list   = []
-
-    for chain in model:
-        chain_id = chain.get_id()
-        for residue in chain:
-            hetflag, resseq, icode = residue.get_id()
-            res_name = residue.get_resname()
-            for atom in residue:
-                coord = atom.get_coord().astype(np.float32)
-                atom_name = atom.get_name()
-                altloc    = atom.get_altloc()
-                element   = atom.element
-                occ       = atom.get_occupancy() if atom.get_occupancy() is not None else 1.00
-                tfac      = atom.get_bfactor()   if atom.get_bfactor()   is not None else 0.00
-                charge    = atom.get_fullname().strip()[-2:].strip()
-
-                atom_coords.append(coord)
-                info_list.append({
-                    'atom_name' : atom_name,
-                    'res_name'  : res_name,
-                    'chain_id'  : chain_id,
-                    'res_id'    : resseq,
-                    'altloc'    : altloc,
-                    'i_code'    : icode,
-                    'occupancy' : occ,
-                    'tempfactor': tfac,
-                    'element'   : element.strip(),
-                    'charge'    : charge
-                })
-
-    if len(atom_coords) == 0:
-        raise ValueError(f"No atom records found in {pdb_path}. Please check the file path or its contents.")
-
-    X_np = np.vstack(atom_coords)
-    X    = torch.from_numpy(X_np)
-    return X, info_list
-
-
-_ATOM_LINE_FMT = "%-6s%5d %4s%1s%3s %1s%4d%1s   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s%2s\n"
-
-def get_all_atom_line(idx_atom: int,
-                      atom_name: str,
-                      res_name: str,
-                      chain_id: str,
-                      res_id: int,
-                      altloc: str,
-                      i_code: str,
-                      x: float, y: float, z: float,
-                      occupancy: float,
-                      tempfactor: float,
-                      element: str,
-                      charge: str) -> str:
-    record   = "ATOM"
-    atom_num = idx_atom
-    atom_name_field = atom_name.rjust(4)[:4]
-    res_name_field  = res_name.ljust(3)[:3]
-    chain_field     = chain_id[:1]
-    i_code_field    = i_code[:1]
-    element_field   = element.strip().rjust(2)[:2]
-    charge_field    = charge.strip().rjust(2)[:2]
-
-    return _ATOM_LINE_FMT % (
-        record,
-        atom_num,
-        atom_name_field,
-        altloc[:1],
-        res_name_field,
-        chain_field,
-        res_id,
-        i_code_field,
-        x, y, z,
-        occupancy,
-        tempfactor,
-        element_field,
-        charge_field
-    )
-
-
-def save_all_atom_pdb(X: torch.Tensor,
-                      info_list: list,
-                      out_path: str):
-    assert X.shape[0] == len(info_list), "Mismatch between X rows and info_list entries."
-
-    with open(out_path, "w") as fp:
-        fp.write("MODEL        1\n")
-        for idx in range(len(info_list)):
-            info = info_list[idx]
-            x, y, z = X[idx].tolist()
-            line = get_all_atom_line(
-                idx_atom   = idx+1,
-                atom_name  = info['atom_name'],
-                res_name   = info['res_name'],
-                chain_id   = info['chain_id'],
-                res_id     = info['res_id'],
-                altloc     = info['altloc'],
-                i_code     = info['i_code'],
-                x=x, y=y, z=z,
-                occupancy  = info['occupancy'],
-                tempfactor = info['tempfactor'],
-                element    = info['element'],
-                charge     = info['charge']
-            )
-            fp.write(line)
-        fp.write("ENDMDL\n")
