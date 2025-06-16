@@ -22,7 +22,7 @@ Z_DIM = 8
 HIDDEN_SIZE = [64, 128, 256]
 LEARNING_RATE = 1e-6
 NUM_EPOCHS = 10000
-WARMUP = 500
+WARMUP = 1000
 
 def train(svi, train_loader, beta, use_cuda=False):
     epoch_loss = 0.0
@@ -82,7 +82,7 @@ def main(args):
 
     patience = 25  # stop if no improvement for 25 epochs
     epochs_without_improve = 0
-
+    best_rmsd = float('inf')
     for epoch in range(NUM_EPOCHS):
         beta = min(1.0, epoch / WARMUP)
         avg_elbo = train(svi, train_loader, beta)
@@ -106,25 +106,28 @@ def main(args):
                     mse_accum += mse
                     zs.append(mu_z.cpu())
                 n_samples += B
-
+        current_rmsd = rmsd_accum / n_samples
         train_mse.append(mse_accum / n_samples)
         train_rmsd.append(rmsd_accum / n_samples)
         latent_hist.append(torch.cat(zs, dim=0).view(-1).numpy())
 
-        torch.save({
-            "desc_dim": descriptor_dim,
-            "D_mean": D_mean.cpu(),
-            "D_std": D_std.cpu(),
-            "state_dict": vae.state_dict()
-        }, "vae_checkpoint.pt")
+        if current_rmsd<best_rmsd:
+            best_rmsd = current_rmsd
 
-        if epoch>WARMUP:
+        elif epoch>WARMUP:
             epochs_without_improve += 1
             if epochs_without_improve >= patience:
                 print(f"Early stopping at epoch {epoch} (best RMSD: {train_rmsd[-patience]:.4f})")
                 break
 
-        print(f"Epoch {epoch:3d} | ELBO={-avg_elbo:8.3f}| MSE={train_mse[-1]:5.3f} | RMSD={train_rmsd[-1]:5.3f}")
+        print(f"Epoch {epoch:3d} | ELBO={-avg_elbo:8.3f}| MSE={train_mse[-1]:5.3f} | RMSD={best_rmsd:5.3f}")
+
+    torch.save({
+        "desc_dim": descriptor_dim,
+        "D_mean": D_mean.cpu(),
+        "D_std": D_std.cpu(),
+        "state_dict": vae.state_dict()
+    }, "vae_checkpoint.pt")
 
     plt.figure()
     plt.plot(train_elbo, label="Train ELBO")
@@ -133,9 +136,9 @@ def main(args):
     plt.legend()
     plt.savefig("plt1.png")
 
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(15, 10))
     plt.subplot(1, 2, 1)
-    plt.plot(train_mse, label="Desc-MSE")
+    plt.plot(train_mse, label="Descriptor MSE")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
     plt.legend()
@@ -146,41 +149,20 @@ def main(args):
     plt.legend()
     plt.savefig("plt2.png")
 
-    D_np = dataset.D.numpy()
-    pca = PCA(n_components=2)
-    D_2d = pca.fit_transform(D_np)
-
-    plt.figure(figsize=(6, 5))
-    plt.scatter(D_2d[:, 0], D_2d[:, 1], alpha=0.7)
-    plt.title("PCA of Clifford-Green Descriptors")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.grid(True)
-    plt.savefig("plt3.png")
-
-    pca_3d = PCA(n_components=3)
-    D_3d = pca_3d.fit_transform(D_np)
-
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(D_3d[:, 0], D_3d[:, 1], D_3d[:, 2], alpha=0.7)
-    ax.set_title("3D PCA of Descriptors")
-    plt.savefig("plt4.png")
-
     for i, z_all in enumerate(latent_hist[::max(1, NUM_EPOCHS // 5)]):
         plt.figure()
         plt.hist(z_all, bins=50, density=True)
         plt.title(f"Epoch {i * (NUM_EPOCHS // 5)} latent z distribution")
         plt.xlabel("z")
         plt.ylabel("Density")
-        plt.savefig("plt"+str(i+5)+".png")
+        plt.savefig("plt"+str(i+3)+".png")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--pdb", type=str, default='data/1unc.pdb')
     p.add_argument("--z_dim", choices=[4, 8, 16, 32], default=8)
     p.add_argument("--hidden_sizes", choices=[[32, 64, 128], [64, 128, 256]], default=[64, 128, 256])
-    p.add_argument("--num_epochs", choices=[500, 1000, 5000, 10000], default=500)
-    p.add_argument("--learning_rate", choices=[1e-5, 2e-5, 5e-5, 1e-6], default=2e-6)
+    p.add_argument("--num_epochs", choices=[500, 1000, 5000, 10000], default=2000)
+    p.add_argument("--learning_rate", choices=[1e-5, 2e-5, 5e-5, 1e-6], default=1e-6)
     args = p.parse_args()
     main(args)
